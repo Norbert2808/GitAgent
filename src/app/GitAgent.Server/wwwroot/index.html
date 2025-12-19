@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Git Agent - Repository Manager</title>
+    <link rel="stylesheet" href="/css/style.css?v=3">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔄 Git Agent</h1>
+            <div class="status">
+                <span id="worker-status" class="status-indicator offline">Worker Offline</span>
+            </div>
+        </header>
+
+        <div id="repositories" class="repositories">
+            <div class="loading">Loading repositories...</div>
+        </div>
+
+        <!-- Commits Modal -->
+        <div id="commits-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 id="modal-title">Commits</h3>
+                    <span class="close" onclick="closeCommitsModal()">&times;</span>
+                </div>
+                <div id="commits-list" class="commits-list">
+                    <div class="loading">Loading commits...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Push Confirmation Modal -->
+        <div id="push-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Push Branch</h3>
+                    <span class="close" onclick="closePushModal()">&times;</span>
+                </div>
+                <div class="modal-body">
+                    <p id="push-message"></p>
+                    <div class="modal-actions">
+                        <button class="btn btn-primary" onclick="confirmPush(false)">Push</button>
+                        <button class="btn btn-danger" onclick="confirmPush(true)">Force Push</button>
+                        <button class="btn btn-secondary" onclick="closePushModal()">Cancel</button>
+                    </div>
+                </div>
+                <div id="push-result" class="push-result"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/app.js?v=2"></script>
+</body>
+</html>
