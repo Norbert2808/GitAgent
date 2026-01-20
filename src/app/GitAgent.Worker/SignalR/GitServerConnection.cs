@@ -84,18 +84,37 @@ public class GitServerConnection
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        try
+        var retryDelays = new[] { 2, 5, 10, 15, 30 }; // seconds
+        var attemptCount = 0;
+
+        while (!cancellationToken.IsCancellationRequested)
         {
-            Log.Information("Connecting to server...");
-            await _connection.StartAsync(cancellationToken);
-            _isConnected = true;
-            Log.Information("✅ Connected to server successfully. Connection ID: {ConnectionId}", _connection.ConnectionId);
-        }
-        catch (Exception ex)
-        {
-            _isConnected = false;
-            Log.Error(ex, "Failed to connect to server");
-            throw;
+            try
+            {
+                attemptCount++;
+                Log.Information("Connecting to server... (Attempt {Attempt})", attemptCount);
+                await _connection.StartAsync(cancellationToken);
+                _isConnected = true;
+                Log.Information("✅ Connected to server successfully. Connection ID: {ConnectionId}", _connection.ConnectionId);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _isConnected = false;
+
+                var delaySeconds = retryDelays[Math.Min(attemptCount - 1, retryDelays.Length - 1)];
+                Log.Warning(ex, "Failed to connect to server (Attempt {Attempt}). Retrying in {Delay} seconds...", attemptCount, delaySeconds);
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log.Information("Connection attempts cancelled by user");
+                    throw;
+                }
+            }
         }
     }
 
