@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  git-agent-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: git-agent-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - ASPNETCORE_URLS=http://+:8080
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ServerConfig__WorkerApiKey=${WORKER_API_KEY:-371dca2c-c035-4cae-9cb7-34c6cfb27ab3}
+    restart: unless-stopped
