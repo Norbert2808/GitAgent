@@ -10,11 +10,25 @@ public class GitAgentServiceRefactored : IGitAgentService
 {
     private readonly GitAgentConfig _config;
     private readonly IProcessExecutor _processExecutor;
+    private readonly Dictionary<string, object> _repositoryLocks = new();
 
     public GitAgentServiceRefactored(IOptions<GitAgentConfig> configuration, IProcessExecutor processExecutor)
     {
         _config = configuration.Value;
         _processExecutor = processExecutor;
+
+        // Initialize locks for each repository
+        _repositoryLocks[_config.InternalRepository.Name] = new object();
+        _repositoryLocks[_config.CustomerRepository.Name] = new object();
+    }
+
+    private object GetRepositoryLock(string repositoryName)
+    {
+        if (_repositoryLocks.TryGetValue(repositoryName, out var lockObj))
+        {
+            return lockObj;
+        }
+        throw new ArgumentException($"Unknown repository: {repositoryName}");
     }
 
     public List<RepositoryInfo> GetRepositoryConfigs()
@@ -51,41 +65,71 @@ public class GitAgentServiceRefactored : IGitAgentService
     {
         return await Task.Run(() =>
         {
-            EnsureRepositoryCloned(repoConfig);
-            EnsureRepositoryCloned(otherRepoConfig);
+            // Lock both repositories in consistent order to prevent deadlock
+            var locks = new[] { repoConfig.Name, otherRepoConfig.Name }
+                .OrderBy(name => name)
+                .Select(name => GetRepositoryLock(name))
+                .ToArray();
 
-            using var repo = new Repository(repoConfig.LocalPath);
-            using var otherRepo = new Repository(otherRepoConfig.LocalPath);
-
-            FetchRemote(repoConfig.LocalPath);
-            FetchRemote(otherRepoConfig.LocalPath);
-
-            var branches = new List<BranchInfo>();
-
-            foreach (var branch in repo.Branches.Where(b => b.IsRemote && b.FriendlyName.StartsWith("origin/")))
+            lock (locks[0])
             {
-                var branchName = branch.FriendlyName.Replace("origin/", "");
-                if (branchName == "HEAD") continue;
-
-                var lastCommit = branch.Tip;
-                var otherBranch = otherRepo.Branches[$"origin/{branchName}"];
-                var isSynchronized = otherBranch != null && otherBranch.Tip.Sha == lastCommit.Sha;
-                var otherCommitHash = otherBranch?.Tip.Sha;
-
-                branches.Add(new BranchInfo
+                lock (locks[1])
                 {
-                    Name = branchName,
-                    LastCommitHash = lastCommit.Sha,
-                    LastCommitMessage = lastCommit.MessageShort,
-                    LastCommitAuthor = lastCommit.Author.Name,
-                    LastCommitDate = lastCommit.Author.When.DateTime,
-                    IsRemote = true,
-                    IsSynchronizedWithOther = isSynchronized,
-                    OtherRepoCommitHash = otherCommitHash
-                });
-            }
+                    try
+                    {
+                        Log.Information($"Getting branches for {repoConfig.Name} with sync to {otherRepoConfig.Name}");
 
-            return branches.OrderByDescending(b => b.LastCommitDate).ToList();
+                        EnsureRepositoryCloned(repoConfig);
+                        EnsureRepositoryCloned(otherRepoConfig);
+
+                        using var repo = new Repository(repoConfig.LocalPath);
+                        using var otherRepo = new Repository(otherRepoConfig.LocalPath);
+
+                        FetchRemote(repoConfig.LocalPath);
+                        FetchRemote(otherRepoConfig.LocalPath);
+
+                        var branches = new List<BranchInfo>();
+
+                        foreach (var branch in repo.Branches.Where(b => b.IsRemote && b.FriendlyName.StartsWith("origin/")))
+                        {
+                            try
+                            {
+                                var branchName = branch.FriendlyName.Replace("origin/", "");
+                                if (branchName == "HEAD") continue;
+
+                                var lastCommit = branch.Tip;
+                                var otherBranch = otherRepo.Branches[$"origin/{branchName}"];
+                                var isSynchronized = otherBranch != null && otherBranch.Tip.Sha == lastCommit.Sha;
+                                var otherCommitHash = otherBranch?.Tip.Sha;
+
+                                branches.Add(new BranchInfo
+                                {
+                                    Name = branchName,
+                                    LastCommitHash = lastCommit.Sha,
+                                    LastCommitMessage = lastCommit.MessageShort,
+                                    LastCommitAuthor = lastCommit.Author.Name,
+                                    LastCommitDate = lastCommit.Author.When.DateTime,
+                                    IsRemote = true,
+                                    IsSynchronizedWithOther = isSynchronized,
+                                    OtherRepoCommitHash = otherCommitHash
+                                });
+                            }
+                            catch (Exception ex)
+                            {
+                                Log.Warning(ex, $"Error processing branch {branch.FriendlyName}, skipping");
+                            }
+                        }
+
+                        Log.Information($"Successfully retrieved {branches.Count} branches for {repoConfig.Name}");
+                        return branches.OrderByDescending(b => b.LastCommitDate).ToList();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, $"Error getting branches for {repoConfig.Name}");
+                        throw;
+                    }
+                }
+            }
         });
     }
 
@@ -94,39 +138,43 @@ public class GitAgentServiceRefactored : IGitAgentService
         return await Task.Run(() =>
         {
             var (repoConfig, _) = GetRepositoryConfigs(repositoryName);
+            var repoLock = GetRepositoryLock(repositoryName);
 
-            EnsureRepositoryCloned(repoConfig);
-
-            using var repo = new Repository(repoConfig.LocalPath);
-            FetchRemote(repoConfig.LocalPath);
-
-            var branch = repo.Branches[$"origin/{branchName}"];
-            if (branch == null)
+            lock (repoLock)
             {
-                Log.Warning($"Branch {branchName} not found in {repositoryName}");
-                return [];
-            }
+                EnsureRepositoryCloned(repoConfig);
 
-            var commits = new List<CommitInfo>();
-            var commitCount = 0;
+                using var repo = new Repository(repoConfig.LocalPath);
+                FetchRemote(repoConfig.LocalPath);
 
-            foreach (var commit in branch.Commits)
-            {
-                if (commitCount >= count) break;
-
-                commits.Add(new CommitInfo
+                var branch = repo.Branches[$"origin/{branchName}"];
+                if (branch == null)
                 {
-                    Hash = commit.Sha,
-                    ShortHash = commit.Sha[..8],
-                    Message = commit.MessageShort,
-                    Author = commit.Author.Name,
-                    Date = commit.Author.When.DateTime
-                });
+                    Log.Warning($"Branch {branchName} not found in {repositoryName}");
+                    return [];
+                }
 
-                commitCount++;
+                var commits = new List<CommitInfo>();
+                var commitCount = 0;
+
+                foreach (var commit in branch.Commits)
+                {
+                    if (commitCount >= count) break;
+
+                    commits.Add(new CommitInfo
+                    {
+                        Hash = commit.Sha,
+                        ShortHash = commit.Sha[..8],
+                        Message = commit.MessageShort,
+                        Author = commit.Author.Name,
+                        Date = commit.Author.When.DateTime
+                    });
+
+                    commitCount++;
+                }
+
+                return commits;
             }
-
-            return commits;
         });
     }
 

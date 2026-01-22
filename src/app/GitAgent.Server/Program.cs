@@ -17,12 +17,19 @@ builder.Host.UseSerilog();
 builder.Services.Configure<ServerConfig>(
     builder.Configuration.GetSection(ServerConfig.SectionName));
 
+// Get server configuration
+var serverConfig = builder.Configuration.GetSection(ServerConfig.SectionName).Get<ServerConfig>() ?? new ServerConfig();
+
 // Add services
 builder.Services.AddControllers();
 builder.Services.AddHttpClient();
 
 // SignalR for Worker communication
-builder.Services.AddSignalR();
+builder.Services.AddSignalR(options =>
+{
+    // Increase message size limit for large branch lists
+    options.MaximumReceiveMessageSize = serverConfig.MaxMessageSizeBytes;
+});
 
 // Worker Service
 builder.Services.AddSingleton<IWorkerService, WorkerService>();

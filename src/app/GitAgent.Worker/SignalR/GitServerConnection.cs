@@ -26,6 +26,11 @@ public class GitServerConnection
             .WithAutomaticReconnect([TimeSpan.Zero, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10)])
             .Build();
 
+        // Increase message size limit for large branch lists
+        _connection.ServerTimeout = TimeSpan.FromMinutes(2);
+        _connection.HandshakeTimeout = TimeSpan.FromSeconds(30);
+        _connection.KeepAliveInterval = TimeSpan.FromSeconds(15);
+
         RegisterHandlers();
         SetupConnectionEvents();
     }
@@ -41,8 +46,18 @@ public class GitServerConnection
 
         _connection.On<string, List<BranchInfo>>(nameof(IWorkerClient.GetBranches), async (repositoryName) =>
         {
-            Log.Information($"Server requested branches for {repositoryName}");
-            return await _gitSyncService.GetBranches(repositoryName);
+            try
+            {
+                Log.Information($"Server requested branches for {repositoryName}");
+                var result = await _gitSyncService.GetBranches(repositoryName);
+                Log.Information($"Returning {result.Count} branches for {repositoryName}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Error getting branches for {repositoryName}");
+                throw;
+            }
         });
 
         _connection.On<GetCommitsRequest, List<CommitInfo>>(nameof(IWorkerClient.GetCommits), async (request) =>
