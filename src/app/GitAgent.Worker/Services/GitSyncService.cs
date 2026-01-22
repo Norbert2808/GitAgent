@@ -10,11 +10,26 @@ public class GitAgentServiceRefactored : IGitAgentService
 {
     private readonly GitAgentConfig _config;
     private readonly IProcessExecutor _processExecutor;
+    private readonly Dictionary<string, object> _repositoryLocks = new();
 
     public GitAgentServiceRefactored(IOptions<GitAgentConfig> configuration, IProcessExecutor processExecutor)
     {
         _config = configuration.Value;
         _processExecutor = processExecutor;
+
+        // Initialize locks for each repository
+        _repositoryLocks[_config.InternalRepository.Name] = new object();
+        _repositoryLocks[_config.CustomerRepository.Name] = new object();
+    }
+
+    private object GetRepositoryLock(string repositoryName)
+    {
+        if (_repositoryLocks.TryGetValue(repositoryName, out var lockObj))
+        {
+            return lockObj;
+        }
+        
+        throw new ArgumentException($"Unknown repository: {repositoryName}");
     }
 
     public List<RepositoryInfo> GetRepositoryConfigs()
@@ -59,62 +74,75 @@ public class GitAgentServiceRefactored : IGitAgentService
     {
         return await Task.Run(() =>
         {
-            try
+            // Lock both repositories in consistent order to prevent deadlock
+            // Always lock in alphabetical order
+            var locks = new[] { repoConfig.Name, otherRepoConfig.Name }
+                .OrderBy(name => name)
+                .Select(GetRepositoryLock)
+                .ToArray();
+
+            lock (locks[0])
             {
-                Log.Information($"Getting branches for {repoConfig.Name} with sync to {otherRepoConfig.Name}");
-
-                EnsureRepositoryCloned(repoConfig);
-                EnsureRepositoryCloned(otherRepoConfig);
-
-                Log.Debug($"Opening repository: {repoConfig.LocalPath}");
-                using var repo = new Repository(repoConfig.LocalPath);
-
-                Log.Debug($"Opening repository: {otherRepoConfig.LocalPath}");
-                using var otherRepo = new Repository(otherRepoConfig.LocalPath);
-
-                FetchRemote(repoConfig.LocalPath);
-                FetchRemote(otherRepoConfig.LocalPath);
-
-                Log.Debug($"Processing branches for {repoConfig.Name}");
-                var branches = new List<BranchInfo>();
-
-                foreach (var branch in repo.Branches.Where(b => b.IsRemote && b.FriendlyName.StartsWith("origin/")))
+                lock (locks[1])
                 {
                     try
                     {
-                        var branchName = branch.FriendlyName.Replace("origin/", "");
-                        if (branchName == "HEAD") continue;
+                        Log.Information($"Getting branches for {repoConfig.Name} with sync to {otherRepoConfig.Name}");
 
-                        var lastCommit = branch.Tip;
-                        var otherBranch = otherRepo.Branches[$"origin/{branchName}"];
-                        var isSynchronized = otherBranch != null && otherBranch.Tip.Sha == lastCommit.Sha;
-                        var otherCommitHash = otherBranch?.Tip.Sha;
+                        EnsureRepositoryCloned(repoConfig);
+                        EnsureRepositoryCloned(otherRepoConfig);
 
-                        branches.Add(new BranchInfo
+                        Log.Debug($"Opening repository: {repoConfig.LocalPath}");
+                        using var repo = new Repository(repoConfig.LocalPath);
+
+                        Log.Debug($"Opening repository: {otherRepoConfig.LocalPath}");
+                        using var otherRepo = new Repository(otherRepoConfig.LocalPath);
+
+                        FetchRemote(repoConfig.LocalPath);
+                        FetchRemote(otherRepoConfig.LocalPath);
+
+                        Log.Debug($"Processing branches for {repoConfig.Name}");
+                        var branches = new List<BranchInfo>();
+
+                        foreach (var branch in repo.Branches.Where(b => b.IsRemote && b.FriendlyName.StartsWith("origin/")))
                         {
-                            Name = branchName,
-                            LastCommitHash = lastCommit.Sha,
-                            LastCommitMessage = lastCommit.MessageShort,
-                            LastCommitAuthor = lastCommit.Author.Name,
-                            LastCommitDate = lastCommit.Author.When.DateTime,
-                            IsRemote = true,
-                            IsSynchronizedWithOther = isSynchronized,
-                            OtherRepoCommitHash = otherCommitHash
-                        });
+                            try
+                            {
+                                var branchName = branch.FriendlyName.Replace("origin/", "");
+                                if (branchName == "HEAD") continue;
+
+                                var lastCommit = branch.Tip;
+                                var otherBranch = otherRepo.Branches[$"origin/{branchName}"];
+                                var isSynchronized = otherBranch != null && otherBranch.Tip.Sha == lastCommit.Sha;
+                                var otherCommitHash = otherBranch?.Tip.Sha;
+
+                                branches.Add(new BranchInfo
+                                {
+                                    Name = branchName,
+                                    LastCommitHash = lastCommit.Sha,
+                                    LastCommitMessage = lastCommit.MessageShort,
+                                    LastCommitAuthor = lastCommit.Author.Name,
+                                    LastCommitDate = lastCommit.Author.When.DateTime,
+                                    IsRemote = true,
+                                    IsSynchronizedWithOther = isSynchronized,
+                                    OtherRepoCommitHash = otherCommitHash
+                                });
+                            }
+                            catch (Exception ex)
+                            {
+                                Log.Warning(ex, $"Error processing branch {branch.FriendlyName}, skipping");
+                            }
+                        }
+
+                        Log.Information($"Successfully retrieved {branches.Count} branches for {repoConfig.Name}");
+                        return branches.OrderByDescending(b => b.LastCommitDate).ToList();
                     }
                     catch (Exception ex)
                     {
-                        Log.Warning(ex, $"Error processing branch {branch.FriendlyName}, skipping");
+                        Log.Error(ex, $"Error getting branches for {repoConfig.Name}");
+                        throw;
                     }
                 }
-
-                Log.Information($"Successfully retrieved {branches.Count} branches for {repoConfig.Name}");
-                return branches.OrderByDescending(b => b.LastCommitDate).ToList();
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, $"Error getting branches for {repoConfig.Name}");
-                throw;
             }
         });
     }
@@ -124,39 +152,43 @@ public class GitAgentServiceRefactored : IGitAgentService
         return await Task.Run(() =>
         {
             var (repoConfig, _) = GetRepositoryConfigs(repositoryName);
+            var repoLock = GetRepositoryLock(repositoryName);
 
-            EnsureRepositoryCloned(repoConfig);
-
-            using var repo = new Repository(repoConfig.LocalPath);
-            FetchRemote(repoConfig.LocalPath);
-
-            var branch = repo.Branches[$"origin/{branchName}"];
-            if (branch == null)
+            lock (repoLock)
             {
-                Log.Warning($"Branch {branchName} not found in {repositoryName}");
-                return [];
-            }
+                EnsureRepositoryCloned(repoConfig);
 
-            var commits = new List<CommitInfo>();
-            var commitCount = 0;
+                using var repo = new Repository(repoConfig.LocalPath);
+                FetchRemote(repoConfig.LocalPath);
 
-            foreach (var commit in branch.Commits)
-            {
-                if (commitCount >= count) break;
-
-                commits.Add(new CommitInfo
+                var branch = repo.Branches[$"origin/{branchName}"];
+                if (branch == null)
                 {
-                    Hash = commit.Sha,
-                    ShortHash = commit.Sha[..8],
-                    Message = commit.MessageShort,
-                    Author = commit.Author.Name,
-                    Date = commit.Author.When.DateTime
-                });
+                    Log.Warning($"Branch {branchName} not found in {repositoryName}");
+                    return [];
+                }
 
-                commitCount++;
+                var commits = new List<CommitInfo>();
+                var commitCount = 0;
+
+                foreach (var commit in branch.Commits)
+                {
+                    if (commitCount >= count) break;
+
+                    commits.Add(new CommitInfo
+                    {
+                        Hash = commit.Sha,
+                        ShortHash = commit.Sha[..8],
+                        Message = commit.MessageShort,
+                        Author = commit.Author.Name,
+                        Date = commit.Author.When.DateTime
+                    });
+
+                    commitCount++;
+                }
+
+                return commits;
             }
-
-            return commits;
         });
     }
 
@@ -176,151 +208,163 @@ public class GitAgentServiceRefactored : IGitAgentService
     {
         return await Task.Run(() =>
         {
-            try
+            // Lock both repositories in consistent order to prevent deadlock
+            var locks = new[] { fromConfig.Name, toConfig.Name }
+                .OrderBy(name => name)
+                .Select(GetRepositoryLock)
+                .ToArray();
+
+            lock (locks[0])
             {
-                EnsureRepositoryCloned(fromConfig);
-                EnsureRepositoryCloned(toConfig);
-
-                using var fromRepository = new Repository(fromConfig.LocalPath);
-                using var toRepository = new Repository(toConfig.LocalPath);
-
-                FetchRemote(fromConfig.LocalPath);
-                FetchRemote(toConfig.LocalPath);
-
-                var fromBranch = fromRepository.Branches[$"origin/{branchName}"];
-                var toBranch = toRepository.Branches[$"origin/{branchName}"];
-
-                if (fromBranch == null)
+                lock (locks[1])
                 {
-                    return new SyncResult
+                    try
                     {
-                        Success = false,
-                        Message = $"❌ Branch '{branchName}' not found in {fromConfig.Name}",
-                        HasConflicts = false
-                    };
-                }
+                        EnsureRepositoryCloned(fromConfig);
+                        EnsureRepositoryCloned(toConfig);
 
-                // Check if already synchronized
-                if (toBranch != null && fromBranch.Tip.Sha == toBranch.Tip.Sha)
-                {
-                    return new SyncResult
-                    {
-                        Success = true,
-                        Message = $"✅ Branch '{branchName}' is already synchronized\nNo push needed",
-                        HasConflicts = false
-                    };
-                }
+                        using var fromRepository = new Repository(fromConfig.LocalPath);
+                        using var toRepository = new Repository(toConfig.LocalPath);
 
-                // Check if fast-forward is possible (toBranch is ancestor of fromBranch)
-                bool canFastForward = false;
-                if (toBranch != null && !force)
-                {
-                    canFastForward = IsAncestor(fromConfig.LocalPath, toBranch.Tip.Sha, fromBranch.Tip.Sha);
+                        FetchRemote(fromConfig.LocalPath);
+                        FetchRemote(toConfig.LocalPath);
 
-                    if (!canFastForward)
-                    {
-                        // Branches have diverged - need force push
-                        return new SyncResult
+                        var fromBranch = fromRepository.Branches[$"origin/{branchName}"];
+                        var toBranch = toRepository.Branches[$"origin/{branchName}"];
+        
+                        if (fromBranch == null)
                         {
-                            Success = false,
-                            HasConflicts = true,
-                            Message = $"⚠️ Branches have diverged!\nFrom: {fromBranch.Tip.Sha.Substring(0, 8)} - {fromBranch.Tip.MessageShort}\nTo: {toBranch.Tip.Sha.Substring(0, 8)} - {toBranch.Tip.MessageShort}\n\nUse Force Push to overwrite.",
-                            ConflictDetails = new List<string>
+                            return new SyncResult
                             {
-                                $"Source: {fromBranch.Tip.MessageShort}",
-                                $"Target: {toBranch.Tip.MessageShort}"
-                            }
-                        };
-                    }
-                }
-
-                // Perform push
-                Log.Information($"Pushing {branchName} from {fromConfig.Name} to {toConfig.Name} (fast-forward: {canFastForward}, force: {force})");
-
-                // Checkout branch locally
-                var checkoutResult = _processExecutor.Execute("git", $"checkout -B {branchName} origin/{branchName}", fromConfig.LocalPath);
-                if (!checkoutResult.Success)
-                {
-                    return new SyncResult
-                    {
-                        Success = false,
-                        Message = $"❌ Failed to checkout branch: {checkoutResult.Error}",
-                        HasConflicts = false
-                    };
-                }
-
-                // Add temporary remote
-                var tempRemoteName = $"temp_{Guid.NewGuid().ToString("N").Substring(0, 8)}";
-                _ = _processExecutor.Execute("git", $"remote add {tempRemoteName} {toConfig.RemoteUrl}", fromConfig.LocalPath);
-
-                try
-                {
-                    // Push
-                    var pushArgs = force ? $"push {tempRemoteName} {branchName} --force" : $"push {tempRemoteName} {branchName}";
-                    var pushResult = _processExecutor.Execute("git", pushArgs, fromConfig.LocalPath);
-
-                    if (!pushResult.Success)
-                    {
-                        Log.Error($"Git push failed: {pushResult.Error}");
-
-                        // Check if this is a "target has more commits" scenario
-                        if ((pushResult.Error.Contains("rejected") || pushResult.Error.Contains("fetch first")) && toBranch != null)
+                                Success = false,
+                                Message = $"❌ Branch '{branchName}' not found in {fromConfig.Name}",
+                                HasConflicts = false
+                            };
+                        }
+        
+                        // Check if already synchronized
+                        if (toBranch != null && fromBranch.Tip.Sha == toBranch.Tip.Sha)
                         {
-                            // Check if the reverse is true (fromBranch is ancestor of toBranch)
-                            var targetIsAhead = IsAncestor(fromConfig.LocalPath, fromBranch.Tip.Sha, toBranch.Tip.Sha);
-
-                            if (targetIsAhead)
+                            return new SyncResult
                             {
+                                Success = true,
+                                Message = $"✅ Branch '{branchName}' is already synchronized\nNo push needed",
+                                HasConflicts = false
+                            };
+                        }
+        
+                        // Check if fast-forward is possible (toBranch is ancestor of fromBranch)
+                        bool canFastForward = false;
+                        if (toBranch != null && !force)
+                        {
+                            canFastForward = IsAncestor(fromConfig.LocalPath, toBranch.Tip.Sha, fromBranch.Tip.Sha);
+        
+                            if (!canFastForward)
+                            {
+                                // Branches have diverged - need force push
                                 return new SyncResult
                                 {
                                     Success = false,
                                     HasConflicts = true,
-                                    Message = $"⚠️ Cannot push - target repository has additional commits!\n\n" +
-                                              $"Source ({fromConfig.Name}): {fromBranch.Tip.Sha.Substring(0, 8)} - {fromBranch.Tip.MessageShort}\n" +
-                                              $"Target ({toConfig.Name}): {toBranch.Tip.Sha.Substring(0, 8)} - {toBranch.Tip.MessageShort}\n\n" +
-                                              $"⚠️ WARNING: Using Force Push will delete commits from {toConfig.Name}!",
-                                    ConflictDetails =
-                                    [
+                                    Message = $"⚠️ Branches have diverged!\nFrom: {fromBranch.Tip.Sha.Substring(0, 8)} - {fromBranch.Tip.MessageShort}\nTo: {toBranch.Tip.Sha.Substring(0, 8)} - {toBranch.Tip.MessageShort}\n\nUse Force Push to overwrite.",
+                                    ConflictDetails = new List<string>
+                                    {
+                                        $"Source: {fromBranch.Tip.MessageShort}",
+                                        $"Target: {toBranch.Tip.MessageShort}"
+                                    }
+                                };
+                            }
+                        }
+        
+                        // Perform push
+                        Log.Information($"Pushing {branchName} from {fromConfig.Name} to {toConfig.Name} (fast-forward: {canFastForward}, force: {force})");
+        
+                        // Checkout branch locally
+                        var checkoutResult = _processExecutor.Execute("git", $"checkout -B {branchName} origin/{branchName}", fromConfig.LocalPath);
+                        if (!checkoutResult.Success)
+                        {
+                            return new SyncResult
+                            {
+                                Success = false,
+                                Message = $"❌ Failed to checkout branch: {checkoutResult.Error}",
+                                HasConflicts = false
+                            };
+                        }
+        
+                        // Add temporary remote
+                        var tempRemoteName = $"temp_{Guid.NewGuid().ToString("N").Substring(0, 8)}";
+                        _ = _processExecutor.Execute("git", $"remote add {tempRemoteName} {toConfig.RemoteUrl}", fromConfig.LocalPath);
+        
+                        try
+                        {
+                            // Push
+                            var pushArgs = force ? $"push {tempRemoteName} {branchName} --force" : $"push {tempRemoteName} {branchName}";
+                            var pushResult = _processExecutor.Execute("git", pushArgs, fromConfig.LocalPath);
+        
+                            if (!pushResult.Success)
+                            {
+                                Log.Error($"Git push failed: {pushResult.Error}");
+        
+                                // Check if this is a "target has more commits" scenario
+                                if ((pushResult.Error.Contains("rejected") || pushResult.Error.Contains("fetch first")) && toBranch != null)
+                                {
+                                    // Check if the reverse is true (fromBranch is ancestor of toBranch)
+                                    var targetIsAhead = IsAncestor(fromConfig.LocalPath, fromBranch.Tip.Sha, toBranch.Tip.Sha);
+        
+                                    if (targetIsAhead)
+                                    {
+                                        return new SyncResult
+                                        {
+                                            Success = false,
+                                            HasConflicts = true,
+                                            Message = $"⚠️ Cannot push - target repository has additional commits!\n\n" +
+                                                      $"Source ({fromConfig.Name}): {fromBranch.Tip.Sha.Substring(0, 8)} - {fromBranch.Tip.MessageShort}\n" +
+                                                      $"Target ({toConfig.Name}): {toBranch.Tip.Sha.Substring(0, 8)} - {toBranch.Tip.MessageShort}\n\n" +
+                                                      $"⚠️ WARNING: Using Force Push will delete commits from {toConfig.Name}!",
+                                            ConflictDetails =
+                                            [
                                         "Target has commits not in source",
                                         "Force push required but will cause data loss"
                                     ]
                                 };
-                            }
-                        }
+                                    }
+                                }
 
+                                return new SyncResult
+                                {
+                                    Success = false,
+                                    Message = $"❌ Push failed: {pushResult.Error}",
+                                    HasConflicts = false
+                                };
+                            }
+
+                            Log.Information($"Successfully pushed {branchName} from {fromConfig.Name} to {toConfig.Name}");
+
+                            var messageType = force ? "⚠️ Force push" : (canFastForward ? "Fast-forward" : "Push");
+                            return new SyncResult
+                            {
+                                Success = true,
+                                Message = $"✅ Successfully synchronized branch '{branchName}'\nFrom: {fromConfig.Name}\nTo: {toConfig.Name}\nType: {messageType}",
+                                HasConflicts = false
+                            };
+                        }
+                        finally
+                        {
+                            // Remove temporary remote
+                            _processExecutor.Execute("git", $"remote remove {tempRemoteName}", fromConfig.LocalPath);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, $"Error pushing branch {branchName}");
                         return new SyncResult
                         {
                             Success = false,
-                            Message = $"❌ Push failed: {pushResult.Error}",
+                            Message = $"❌ Synchronization error: {ex.Message}",
                             HasConflicts = false
                         };
                     }
-
-                    Log.Information($"Successfully pushed {branchName} from {fromConfig.Name} to {toConfig.Name}");
-
-                    var messageType = force ? "⚠️ Force push" : (canFastForward ? "Fast-forward" : "Push");
-                    return new SyncResult
-                    {
-                        Success = true,
-                        Message = $"✅ Successfully synchronized branch '{branchName}'\nFrom: {fromConfig.Name}\nTo: {toConfig.Name}\nType: {messageType}",
-                        HasConflicts = false
-                    };
                 }
-                finally
-                {
-                    // Remove temporary remote
-                    _processExecutor.Execute("git", $"remote remove {tempRemoteName}", fromConfig.LocalPath);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, $"Error pushing branch {branchName}");
-                return new SyncResult
-                {
-                    Success = false,
-                    Message = $"❌ Synchronization error: {ex.Message}",
-                    HasConflicts = false
-                };
             }
         });
     }
@@ -356,10 +400,35 @@ public class GitAgentServiceRefactored : IGitAgentService
 
     private void EnsureRepositoryCloned(RepositoryConfig config)
     {
-        if (Directory.Exists(config.LocalPath) && Repository.IsValid(config.LocalPath))
+        // Note: This method is always called within a repository lock, so no additional locking needed
+
+        // Check if directory exists and contains .git folder
+        var gitDir = Path.Combine(config.LocalPath, ".git");
+        if (Directory.Exists(config.LocalPath) && Directory.Exists(gitDir))
         {
-            // Repository already exists and is valid
-            return;
+            Log.Debug($"Repository {config.Name} already exists at {config.LocalPath}");
+
+            // Try to validate with LibGit2Sharp
+            try
+            {
+                if (Repository.IsValid(config.LocalPath))
+                {
+                    Log.Debug($"Repository {config.Name} is valid");
+                    return;
+                }
+                else
+                {
+                    Log.Warning($"Repository exists but IsValid returned false for {config.LocalPath}");
+                    // Still return - directory has .git folder, so it's a git repo
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, $"Error validating repository {config.Name}, but .git folder exists");
+                // Still return - directory has .git folder
+                return;
+            }
         }
 
         Log.Warning($"Repository {config.Name} not found at {config.LocalPath}");
