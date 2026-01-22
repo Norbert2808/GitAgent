@@ -28,8 +28,16 @@ public class GitAgentServiceRefactored : IGitAgentService
 
     public async Task<List<BranchInfo>> GetBranches(string repositoryName)
     {
-        var (repoConfig, otherRepoConfig) = GetRepositoryConfigs(repositoryName);
-        return await GetBranchesWithSync(repoConfig, otherRepoConfig);
+        try
+        {
+            var (repoConfig, otherRepoConfig) = GetRepositoryConfigs(repositoryName);
+            return await GetBranchesWithSync(repoConfig, otherRepoConfig);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, $"Error getting branches for {repositoryName}");
+            throw;
+        }
     }
 
     private (RepositoryConfig repo, RepositoryConfig other) GetRepositoryConfigs(string repositoryName)
@@ -51,41 +59,63 @@ public class GitAgentServiceRefactored : IGitAgentService
     {
         return await Task.Run(() =>
         {
-            EnsureRepositoryCloned(repoConfig);
-            EnsureRepositoryCloned(otherRepoConfig);
-
-            using var repo = new Repository(repoConfig.LocalPath);
-            using var otherRepo = new Repository(otherRepoConfig.LocalPath);
-
-            FetchRemote(repoConfig.LocalPath);
-            FetchRemote(otherRepoConfig.LocalPath);
-
-            var branches = new List<BranchInfo>();
-
-            foreach (var branch in repo.Branches.Where(b => b.IsRemote && b.FriendlyName.StartsWith("origin/")))
+            try
             {
-                var branchName = branch.FriendlyName.Replace("origin/", "");
-                if (branchName == "HEAD") continue;
+                Log.Information($"Getting branches for {repoConfig.Name} with sync to {otherRepoConfig.Name}");
 
-                var lastCommit = branch.Tip;
-                var otherBranch = otherRepo.Branches[$"origin/{branchName}"];
-                var isSynchronized = otherBranch != null && otherBranch.Tip.Sha == lastCommit.Sha;
-                var otherCommitHash = otherBranch?.Tip.Sha;
+                EnsureRepositoryCloned(repoConfig);
+                EnsureRepositoryCloned(otherRepoConfig);
 
-                branches.Add(new BranchInfo
+                Log.Debug($"Opening repository: {repoConfig.LocalPath}");
+                using var repo = new Repository(repoConfig.LocalPath);
+
+                Log.Debug($"Opening repository: {otherRepoConfig.LocalPath}");
+                using var otherRepo = new Repository(otherRepoConfig.LocalPath);
+
+                FetchRemote(repoConfig.LocalPath);
+                FetchRemote(otherRepoConfig.LocalPath);
+
+                Log.Debug($"Processing branches for {repoConfig.Name}");
+                var branches = new List<BranchInfo>();
+
+                foreach (var branch in repo.Branches.Where(b => b.IsRemote && b.FriendlyName.StartsWith("origin/")))
                 {
-                    Name = branchName,
-                    LastCommitHash = lastCommit.Sha,
-                    LastCommitMessage = lastCommit.MessageShort,
-                    LastCommitAuthor = lastCommit.Author.Name,
-                    LastCommitDate = lastCommit.Author.When.DateTime,
-                    IsRemote = true,
-                    IsSynchronizedWithOther = isSynchronized,
-                    OtherRepoCommitHash = otherCommitHash
-                });
-            }
+                    try
+                    {
+                        var branchName = branch.FriendlyName.Replace("origin/", "");
+                        if (branchName == "HEAD") continue;
 
-            return branches.OrderByDescending(b => b.LastCommitDate).ToList();
+                        var lastCommit = branch.Tip;
+                        var otherBranch = otherRepo.Branches[$"origin/{branchName}"];
+                        var isSynchronized = otherBranch != null && otherBranch.Tip.Sha == lastCommit.Sha;
+                        var otherCommitHash = otherBranch?.Tip.Sha;
+
+                        branches.Add(new BranchInfo
+                        {
+                            Name = branchName,
+                            LastCommitHash = lastCommit.Sha,
+                            LastCommitMessage = lastCommit.MessageShort,
+                            LastCommitAuthor = lastCommit.Author.Name,
+                            LastCommitDate = lastCommit.Author.When.DateTime,
+                            IsRemote = true,
+                            IsSynchronizedWithOther = isSynchronized,
+                            OtherRepoCommitHash = otherCommitHash
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(ex, $"Error processing branch {branch.FriendlyName}, skipping");
+                    }
+                }
+
+                Log.Information($"Successfully retrieved {branches.Count} branches for {repoConfig.Name}");
+                return branches.OrderByDescending(b => b.LastCommitDate).ToList();
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Error getting branches for {repoConfig.Name}");
+                throw;
+            }
         });
     }
 
@@ -377,15 +407,20 @@ public class GitAgentServiceRefactored : IGitAgentService
     {
         try
         {
+            Log.Information($"Fetching updates from {repoPath}...");
             var result = _processExecutor.Execute("git", "fetch origin --prune", repoPath);
             if (!result.Success)
             {
-                Log.Warning($"Git fetch warning: {result.Error}");
+                Log.Warning($"Git fetch warning for {repoPath}: {result.Error}");
+            }
+            else
+            {
+                Log.Information($"Successfully fetched updates from {repoPath}");
             }
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Failed to fetch remote updates, using cached data");
+            Log.Warning(ex, $"Failed to fetch remote updates from {repoPath}, using cached data");
         }
     }
 }

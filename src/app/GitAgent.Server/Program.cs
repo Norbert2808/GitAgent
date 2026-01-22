@@ -17,12 +17,20 @@ builder.Host.UseSerilog();
 builder.Services.Configure<ServerConfig>(
     builder.Configuration.GetSection(ServerConfig.SectionName));
 
+// Get timeout configuration
+var serverConfig = builder.Configuration.GetSection(ServerConfig.SectionName).Get<ServerConfig>() ?? new ServerConfig();
+
 // Add services
 builder.Services.AddControllers();
 builder.Services.AddHttpClient();
 
 // SignalR for Worker communication
-builder.Services.AddSignalR();
+builder.Services.AddSignalR(options =>
+{
+    options.ClientTimeoutInterval = TimeSpan.FromSeconds(serverConfig.SignalRTimeouts.ClientTimeoutSeconds);
+    options.HandshakeTimeout = TimeSpan.FromSeconds(serverConfig.SignalRTimeouts.HandshakeTimeoutSeconds);
+    options.KeepAliveInterval = TimeSpan.FromSeconds(serverConfig.SignalRTimeouts.KeepAliveIntervalSeconds);
+});
 
 // Worker Service
 builder.Services.AddSingleton<IWorkerService, WorkerService>();

@@ -40,7 +40,7 @@ try
     {
         var gitService = sp.GetRequiredService<IGitAgentService>();
         var config = sp.GetRequiredService<IOptions<WorkerConfig>>().Value;
-        return new GitServerConnection(config.ServerUrl, config.ApiKey, gitService);
+        return new GitServerConnection(config.ServerUrl, config.ApiKey, gitService, config.Timeouts);
     });
 
     var host = builder.Build();

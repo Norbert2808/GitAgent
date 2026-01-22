@@ -5,6 +5,8 @@ using GitAgent.Shared.Models;
 using GitAgent.Shared.Interfaces;
 using GitAgent.Worker.Services;
 using GitAgent.Shared.DTOs;
+using GitAgent.Worker.Configuration;
+using Microsoft.Extensions.Logging;
 
 namespace GitAgent.Worker.SignalR;
 
@@ -12,19 +14,31 @@ public class GitServerConnection
 {
     private readonly HubConnection _connection;
     private readonly IGitAgentService _gitSyncService;
+    private readonly int[] _reconnectDelays;
     private bool _isConnected;
 
-    public GitServerConnection(string serverUrl, string apiKey, IGitAgentService gitSyncService)
+    public GitServerConnection(string serverUrl, string apiKey, IGitAgentService gitSyncService, TimeoutConfig timeouts)
     {
         _gitSyncService = gitSyncService;
+        _reconnectDelays = timeouts.ReconnectDelaysSeconds;
+
+        var reconnectDelays = timeouts.ReconnectDelaysSeconds.Select(seconds => TimeSpan.FromSeconds(seconds)).ToArray();
 
         _connection = new HubConnectionBuilder()
             .WithUrl($"{serverUrl}/workerhub", options =>
             {
                 options.Headers[Constants.ApiKeyHeaderName] = apiKey;
             })
-            .WithAutomaticReconnect([TimeSpan.Zero, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10)])
+            .WithAutomaticReconnect(reconnectDelays)
+            .ConfigureLogging(logging =>
+            {
+                logging.SetMinimumLevel(LogLevel.Warning);
+            })
             .Build();
+
+        _connection.ServerTimeout = TimeSpan.FromSeconds(timeouts.SignalR.ServerTimeoutSeconds);
+        _connection.HandshakeTimeout = TimeSpan.FromSeconds(timeouts.SignalR.HandshakeTimeoutSeconds);
+        _connection.KeepAliveInterval = TimeSpan.FromSeconds(timeouts.SignalR.KeepAliveIntervalSeconds);
 
         RegisterHandlers();
         SetupConnectionEvents();
@@ -35,26 +49,66 @@ public class GitServerConnection
         // Register methods that Server can call on Worker
         _connection.On(nameof(IWorkerClient.GetRepositoryConfigs), () =>
         {
-            Log.Information("Server requested repository configurations");
-            return _gitSyncService.GetRepositoryConfigs();
+            try
+            {
+                Log.Information("Server requested repository configurations");
+                var result = _gitSyncService.GetRepositoryConfigs();
+                Log.Information($"Returned {result.Count} repository configurations");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "ERROR in GetRepositoryConfigs handler");
+                throw;
+            }
         });
 
         _connection.On<string, List<BranchInfo>>(nameof(IWorkerClient.GetBranches), async (repositoryName) =>
         {
-            Log.Information($"Server requested branches for {repositoryName}");
-            return await _gitSyncService.GetBranches(repositoryName);
+            try
+            {
+                Log.Information($"Server requested branches for {repositoryName}");
+                var result = await _gitSyncService.GetBranches(repositoryName);
+                Log.Information($"Successfully retrieved {result.Count} branches for {repositoryName}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"ERROR in GetBranches handler for {repositoryName}");
+                throw;
+            }
         });
 
         _connection.On<GetCommitsRequest, List<CommitInfo>>(nameof(IWorkerClient.GetCommits), async (request) =>
         {
-            Log.Information($"Server requested commits for {request.Repository}/{request.Branch}");
-            return await _gitSyncService.GetBranchCommits(request.Branch, request.Repository, request.Count);
+            try
+            {
+                Log.Information($"Server requested commits for {request.Repository}/{request.Branch}");
+                var result = await _gitSyncService.GetBranchCommits(request.Branch, request.Repository, request.Count);
+                Log.Information($"Returned {result.Count} commits for {request.Repository}/{request.Branch}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"ERROR in GetCommits handler for {request.Repository}/{request.Branch}");
+                throw;
+            }
         });
 
         _connection.On<PushBranchRequest, SyncResult>(nameof(IWorkerClient.PushBranch), async (request) =>
         {
-            Log.Information($"Server requested push from {request.FromRepository} to {request.ToRepository}: {request.Branch} (force: {request.Force})");
-            return await _gitSyncService.PushBranch(request.Branch, request.FromRepository, request.ToRepository, request.Force);
+            try
+            {
+                Log.Information($"Server requested push from {request.FromRepository} to {request.ToRepository}: {request.Branch} (force: {request.Force})");
+                var result = await _gitSyncService.PushBranch(request.Branch, request.FromRepository, request.ToRepository, request.Force);
+                Log.Information($"Push completed: {result.Success} - {result.Message}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"ERROR in PushBranch handler for {request.Branch}");
+                throw;
+            }
         });
     }
 
@@ -84,7 +138,6 @@ public class GitServerConnection
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        var retryDelays = new[] { 2, 5, 10, 15, 30 }; // seconds
         var attemptCount = 0;
 
         while (!cancellationToken.IsCancellationRequested)
@@ -102,7 +155,7 @@ public class GitServerConnection
             {
                 _isConnected = false;
 
-                var delaySeconds = retryDelays[Math.Min(attemptCount - 1, retryDelays.Length - 1)];
+                var delaySeconds = _reconnectDelays[Math.Min(attemptCount - 1, _reconnectDelays.Length - 1)];
                 Log.Warning(ex, "Failed to connect to server (Attempt {Attempt}). Retrying in {Delay} seconds...", attemptCount, delaySeconds);
 
                 try

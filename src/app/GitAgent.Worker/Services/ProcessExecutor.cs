@@ -1,4 +1,6 @@
 using Serilog;
+using Microsoft.Extensions.Options;
+using GitAgent.Worker.Configuration;
 
 namespace GitAgent.Worker.Services;
 
@@ -9,6 +11,13 @@ public interface IProcessExecutor
 
 public class ProcessExecutor : IProcessExecutor
 {
+    private readonly int _timeoutSeconds;
+
+    public ProcessExecutor(IOptions<WorkerConfig> config)
+    {
+        _timeoutSeconds = config.Value.Timeouts.GitProcessTimeoutSeconds;
+    }
+
     public ProcessResult Execute(string fileName, string arguments, string workingDirectory)
     {
         var process = new System.Diagnostics.Process
@@ -27,24 +36,56 @@ public class ProcessExecutor : IProcessExecutor
 
         Log.Debug($"Executing: {fileName} {arguments} in {workingDirectory}");
 
-        process.Start();
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-
-        var result = new ProcessResult
+        try
         {
-            ExitCode = process.ExitCode,
-            Output = output,
-            Error = error
-        };
+            process.Start();
+            var output = process.StandardOutput.ReadToEnd();
+            var error = process.StandardError.ReadToEnd();
 
-        if (result.ExitCode != 0)
-        {
-            Log.Warning($"Process exited with code {result.ExitCode}. Error: {result.Error}");
+            if (!process.WaitForExit(_timeoutSeconds * 1000))
+            {
+                Log.Error($"Process timeout after {_timeoutSeconds} seconds. Killing process.");
+                try
+                {
+                    process.Kill();
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Failed to kill timed out process");
+                }
+
+                return new ProcessResult
+                {
+                    ExitCode = -1,
+                    Output = output,
+                    Error = $"Process timed out after {_timeoutSeconds} seconds"
+                };
+            }
+
+            var result = new ProcessResult
+            {
+                ExitCode = process.ExitCode,
+                Output = output,
+                Error = error
+            };
+
+            if (result.ExitCode != 0)
+            {
+                Log.Warning($"Process exited with code {result.ExitCode}. Error: {result.Error}");
+            }
+
+            return result;
         }
-
-        return result;
+        catch (Exception ex)
+        {
+            Log.Error(ex, $"Error executing process: {fileName} {arguments}");
+            return new ProcessResult
+            {
+                ExitCode = -1,
+                Output = string.Empty,
+                Error = $"Process execution error: {ex.Message}"
+            };
+        }
     }
 }
 
